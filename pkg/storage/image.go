@@ -17,16 +17,18 @@ import (
 	"github.com/containers/image/types"
 	"github.com/containers/storage"
 	distreference "github.com/docker/distribution/reference"
+	digest "github.com/opencontainers/go-digest"
 )
 
 // ImageResult wraps a subset of information about an image: its ID, its names,
 // and the size, if known, or nil if it isn't.
 type ImageResult struct {
-	ID       string
-	Names    []string
-	Digests  []string
-	Size     *uint64
-	ImageRef string
+	ID           string
+	RepoTags     []string
+	RepoDigests  []string
+	Size         *uint64
+	Digest       digest.Digest
+	ConfigDigest digest.Digest
 }
 
 type indexInfo struct {
@@ -49,6 +51,9 @@ type ImageServer interface {
 	ListImages(systemContext *types.SystemContext, filter string) ([]ImageResult, error)
 	// ImageStatus returns status of an image which matches the filter.
 	ImageStatus(systemContext *types.SystemContext, filter string) (*ImageResult, error)
+	// PrepareImage returns an Image where the config digest can be grabbed
+	// for further analysis. Call Close() on the resulting image.
+	PrepareImage(systemContext *types.SystemContext, imageName string, options *copy.Options) (types.Image, error)
 	// PullImage imports an image from the specified location.
 	PullImage(systemContext *types.SystemContext, imageName string, options *copy.Options) (types.ImageReference, error)
 	// UntagImage removes a name from the specified image, and if it was
@@ -83,6 +88,17 @@ func (svc *imageService) getRef(name string) (types.ImageReference, error) {
 	return ref, nil
 }
 
+func sortNamesByType(names []string) (tags, digests []string) {
+	for _, name := range names {
+		if len(name) > 72 && name[len(name)-72:len(name)-64] == "@sha256:" {
+			digests = append(digests, name)
+		} else {
+			tags = append(tags, name)
+		}
+	}
+	return tags, digests
+}
+
 func (svc *imageService) ListImages(systemContext *types.SystemContext, filter string) ([]ImageResult, error) {
 	results := []ImageResult{}
 	if filter != "" {
@@ -96,12 +112,15 @@ func (svc *imageService) ListImages(systemContext *types.SystemContext, filter s
 				return nil, err
 			}
 			size := imageSize(img)
-			img.Close()
+			tags, digests := sortNamesByType(image.Names)
 			results = append(results, ImageResult{
-				ID:    image.ID,
-				Names: image.Names,
-				Size:  size,
+				ID:           image.ID,
+				RepoTags:     tags,
+				RepoDigests:  digests,
+				Size:         size,
+				ConfigDigest: img.ConfigInfo().Digest,
 			})
+			img.Close()
 		}
 	} else {
 		images, err := svc.store.Images()
@@ -118,12 +137,15 @@ func (svc *imageService) ListImages(systemContext *types.SystemContext, filter s
 				return nil, err
 			}
 			size := imageSize(img)
-			img.Close()
+			tags, digests := sortNamesByType(image.Names)
 			results = append(results, ImageResult{
-				ID:    image.ID,
-				Names: image.Names,
-				Size:  size,
+				ID:           image.ID,
+				RepoTags:     tags,
+				RepoDigests:  digests,
+				Size:         size,
+				ConfigDigest: img.ConfigInfo().Digest,
 			})
+			img.Close()
 		}
 	}
 	return results, nil
@@ -151,19 +173,34 @@ func (svc *imageService) ImageStatus(systemContext *types.SystemContext, nameOrI
 	if err != nil {
 		return nil, err
 	}
+	defer img.Close()
 	size := imageSize(img)
-	img.Close()
 
+	tags, digests := sortNamesByType(image.Names)
 	result := ImageResult{
-		ID:    image.ID,
-		Names: image.Names,
-		Size:  size,
+		ID:           image.ID,
+		RepoTags:     tags,
+		RepoDigests:  digests,
+		Size:         size,
+		ConfigDigest: img.ConfigInfo().Digest,
 	}
-	if len(image.Names) > 0 {
-		result.ImageRef = image.Names[0]
-		if ref2, err2 := istorage.Transport.ParseStoreReference(svc.store, image.Names[0]); err2 == nil {
-			if dref := ref2.DockerReference(); dref != nil {
-				result.ImageRef = reference.FamiliarString(dref)
+
+	if imgDigest, err := svc.store.ImageBigDataDigest(image.ID, storage.ImageDigestBigDataKey); err == nil && imgDigest != "" {
+		result.Digest = imgDigest
+		if len(tags) > 0 {
+			digestMap := make(map[string]struct{})
+			for _, tag := range append([]string{nameOrID}, tags...) {
+				if ref2, err2 := istorage.Transport.ParseStoreReference(svc.store, tag); err2 == nil {
+					if dref := ref2.DockerReference(); dref != nil {
+						trimmed := reference.TrimNamed(dref)
+						if imageRef, err := reference.WithDigest(trimmed, result.Digest); err == nil {
+							if _, ok := digestMap[imageRef.String()]; !ok {
+								result.RepoDigests = append(result.RepoDigests, imageRef.String())
+								digestMap[imageRef.String()] = struct{}{}
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -180,7 +217,7 @@ func imageSize(img types.Image) *uint64 {
 }
 
 func (svc *imageService) CanPull(imageName string, options *copy.Options) (bool, error) {
-	srcRef, err := svc.prepareImage(imageName, options)
+	srcRef, err := svc.prepareReference(imageName, options)
 	if err != nil {
 		return false, err
 	}
@@ -188,7 +225,11 @@ func (svc *imageService) CanPull(imageName string, options *copy.Options) (bool,
 	if err != nil {
 		return false, err
 	}
-	src, err := image.FromSource(rawSource)
+	sourceCtx := &types.SystemContext{}
+	if options.SourceCtx != nil {
+		sourceCtx = options.SourceCtx
+	}
+	src, err := image.FromSource(sourceCtx, rawSource)
 	if err != nil {
 		rawSource.Close()
 		return false, err
@@ -197,9 +238,9 @@ func (svc *imageService) CanPull(imageName string, options *copy.Options) (bool,
 	return true, nil
 }
 
-// prepareImage creates an image reference from an image string and set options
+// prepareReference creates an image reference from an image string and set options
 // for the source context
-func (svc *imageService) prepareImage(imageName string, options *copy.Options) (types.ImageReference, error) {
+func (svc *imageService) prepareReference(imageName string, options *copy.Options) (types.ImageReference, error) {
 	if imageName == "" {
 		return nil, storage.ErrNotAnImage
 	}
@@ -227,6 +268,18 @@ func (svc *imageService) prepareImage(imageName string, options *copy.Options) (
 	return srcRef, nil
 }
 
+func (svc *imageService) PrepareImage(systemContext *types.SystemContext, imageName string, options *copy.Options) (types.Image, error) {
+	if options == nil {
+		options = &copy.Options{}
+	}
+
+	srcRef, err := svc.prepareReference(imageName, options)
+	if err != nil {
+		return nil, err
+	}
+	return srcRef.NewImage(systemContext)
+}
+
 func (svc *imageService) PullImage(systemContext *types.SystemContext, imageName string, options *copy.Options) (types.ImageReference, error) {
 	policy, err := signature.DefaultPolicy(systemContext)
 	if err != nil {
@@ -240,7 +293,7 @@ func (svc *imageService) PullImage(systemContext *types.SystemContext, imageName
 		options = &copy.Options{}
 	}
 
-	srcRef, err := svc.prepareImage(imageName, options)
+	srcRef, err := svc.prepareReference(imageName, options)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +339,7 @@ func (svc *imageService) UntagImage(systemContext *types.SystemContext, nameOrID
 	}
 
 	if nameOrID != img.ID {
-		namedRef, err := svc.prepareImage(nameOrID, &copy.Options{})
+		namedRef, err := svc.prepareReference(nameOrID, &copy.Options{})
 		if err != nil {
 			return err
 		}

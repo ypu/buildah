@@ -186,7 +186,7 @@ func FindImage(store storage.Store, image string) (*storage.Image, error) {
 }
 
 // FindImageRef searches for and returns a new types.Image matching the given name or ID in the given store.
-func FindImageRef(store storage.Store, image string) (types.Image, error) {
+func FindImageRef(store storage.Store, image string) (types.ImageCloser, error) {
 	img, err := FindImage(store, image)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to locate image %q", image)

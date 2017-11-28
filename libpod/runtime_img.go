@@ -228,7 +228,7 @@ func (k *Image) GetManifest() error {
 	if err != nil {
 		return errors.Wrapf(err, "unable to create new image source")
 	}
-	_, _, err = imageSource.GetManifest()
+	_, _, err = imageSource.GetManifest(nil)
 	if err == nil {
 		return nil
 	}
@@ -383,8 +383,11 @@ func (k *Image) HasLatest() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	_, _, err = pullRef.(types.ImageSource).GetManifest()
-	return false, err
+	_, _, err = pullRef.(types.ImageSource).GetManifest(nil)
+	if err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // Pull is a wrapper function to pull and image
@@ -878,7 +881,7 @@ func (r *Runtime) GetImageRef(image string) (types.Image, error) {
 
 }
 
-func (r *Runtime) getImageRef(image string) (types.Image, error) {
+func (r *Runtime) getImageRef(image string) (types.ImageCloser, error) {
 	img, err := r.getImage(image)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to locate image %q", image)
