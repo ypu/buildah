@@ -44,9 +44,30 @@ func newReference(transport storageTransport, reference, id string, name referen
 // one present with the same name or ID, and return the image.
 func (s *storageReference) resolveImage() (*storage.Image, error) {
 	if s.id == "" {
+		// Look for an image that has the expanded reference name as a Name value.
 		image, err := s.transport.store.Image(s.reference)
 		if image != nil && err == nil {
 			s.id = image.ID
+		}
+	}
+	if s.id == "" && s.name != nil && s.digest != "" {
+		// Look for an image with the specified digest that has the same name,
+		// though possibly with a different tag or digest, as a Name value, so
+		// that the canonical reference can be implicitly resolved to the image.
+		images, err := s.transport.store.ImagesByDigest(s.digest)
+		if images != nil && err == nil {
+			spec := reference.FamiliarName(s.name)
+		search:
+			for _, image := range images {
+				for _, name := range image.Names {
+					if named, err := reference.ParseNormalizedNamed(name); err == nil {
+						if reference.FamiliarName(reference.TrimNamed(named)) == spec {
+							s.id = image.ID
+							break search
+						}
+					}
+				}
+			}
 		}
 	}
 	if s.id == "" {
@@ -57,12 +78,15 @@ func (s *storageReference) resolveImage() (*storage.Image, error) {
 	if err != nil {
 		return nil, errors.Wrapf(err, "error reading image %q", s.id)
 	}
-	if s.reference != "" {
+	if s.name != nil {
+		spec := reference.FamiliarName(s.name)
 		nameMatch := false
 		for _, name := range img.Names {
-			if name == s.reference {
-				nameMatch = true
-				break
+			if named, err := reference.ParseNormalizedNamed(name); err == nil {
+				if reference.FamiliarName(reference.TrimNamed(named)) == spec {
+					nameMatch = true
+					break
+				}
 			}
 		}
 		if !nameMatch {
@@ -152,8 +176,13 @@ func (s storageReference) PolicyConfigurationNamespaces() []string {
 	return namespaces
 }
 
-func (s storageReference) NewImage(ctx *types.SystemContext) (types.Image, error) {
-	return newImage(s)
+// NewImage returns a types.ImageCloser for this reference, possibly specialized for this ImageTransport.
+// The caller must call .Close() on the returned ImageCloser.
+// NOTE: If any kind of signature verification should happen, build an UnparsedImage from the value returned by NewImageSource,
+// verify that UnparsedImage, and convert it into a real Image via image.FromUnparsedImage.
+// WARNING: This may not do the right thing for a manifest list, see image.FromSource for details.
+func (s storageReference) NewImage(ctx *types.SystemContext) (types.ImageCloser, error) {
+	return newImage(ctx, s)
 }
 
 func (s storageReference) DeleteImage(ctx *types.SystemContext) error {
@@ -176,5 +205,5 @@ func (s storageReference) NewImageSource(ctx *types.SystemContext) (types.ImageS
 }
 
 func (s storageReference) NewImageDestination(ctx *types.SystemContext) (types.ImageDestination, error) {
-	return newImageDestination(s)
+	return newImageDestination(ctx, s)
 }

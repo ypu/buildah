@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/containers/image/types"
+	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -45,7 +46,7 @@ func OCI1Clone(src *OCI1) *OCI1 {
 
 // ConfigInfo returns a complete BlobInfo for the separate config object, or a BlobInfo{Digest:""} if there isn't a separate object.
 func (m *OCI1) ConfigInfo() types.BlobInfo {
-	return types.BlobInfo{Digest: m.Config.Digest, Size: m.Config.Size, Annotations: m.Config.Annotations, MediaType: imgspecv1.MediaTypeImageConfig}
+	return types.BlobInfo{Digest: m.Config.Digest, Size: m.Config.Size, Annotations: m.Config.Annotations}
 }
 
 // LayerInfos returns a list of BlobInfos of layers referenced by this image, in order (the root layer first, and then successive layered layers).
@@ -92,17 +93,28 @@ func (m *OCI1) Inspect(configGetter func(types.BlobInfo) ([]byte, error)) (*type
 	if err := json.Unmarshal(config, v1); err != nil {
 		return nil, err
 	}
+	d1 := &Schema2V1Image{}
+	json.Unmarshal(config, d1)
 	created := time.Time{}
 	if v1.Created != nil {
 		created = *v1.Created
 	}
-	return &types.ImageInspectInfo{
+	i := &types.ImageInspectInfo{
 		Tag:           "",
 		Created:       created,
-		DockerVersion: "",
+		DockerVersion: d1.DockerVersion,
 		Labels:        v1.Config.Labels,
 		Architecture:  v1.Architecture,
 		Os:            v1.OS,
-		Layers:        []string{},
-	}, nil
+		Layers:        LayerInfosToStrings(m.LayerInfos()),
+	}
+	return i, nil
+}
+
+// ImageID computes an ID which can uniquely identify this image by its contents.
+func (m *OCI1) ImageID([]digest.Digest) (string, error) {
+	if err := m.Config.Digest.Validate(); err != nil {
+		return "", err
+	}
+	return m.Config.Digest.Hex(), nil
 }

@@ -226,11 +226,11 @@ func (s storageTransport) ParseStoreReference(store storage.Store, ref string) (
 		}
 	}
 	if refname == "" {
-		logrus.Debugf("parsed reference into %q", storeSpec+"@"+id)
+		logrus.Debugf("parsed reference to id into %q", storeSpec+"@"+id)
 	} else if id == "" {
-		logrus.Debugf("parsed reference into %q", storeSpec+refname)
+		logrus.Debugf("parsed reference to refname into %q", storeSpec+refname)
 	} else {
-		logrus.Debugf("parsed reference into %q", storeSpec+refname+"@"+id)
+		logrus.Debugf("parsed reference to refname@id into %q", storeSpec+refname+"@"+id)
 	}
 	return newReference(storageTransport{store: store, defaultUIDMap: s.defaultUIDMap, defaultGIDMap: s.defaultGIDMap}, refname, id, name, tag, sum), nil
 }
@@ -337,17 +337,23 @@ func (s *storageTransport) ParseReference(reference string) (types.ImageReferenc
 
 func (s storageTransport) GetStoreImage(store storage.Store, ref types.ImageReference) (*storage.Image, error) {
 	dref := ref.DockerReference()
-	if dref == nil {
-		if sref, ok := ref.(*storageReference); ok {
-			if sref.id != "" {
-				if img, err := store.Image(sref.id); err == nil {
-					return img, nil
-				}
+	if dref != nil {
+		if img, err := store.Image(verboseName(dref)); err == nil {
+			return img, nil
+		}
+	}
+	if sref, ok := ref.(*storageReference); ok {
+		if sref.id != "" {
+			if img, err := store.Image(sref.id); err == nil {
+				return img, nil
 			}
 		}
-		return nil, ErrInvalidReference
+		tmpRef := *sref
+		if img, err := tmpRef.resolveImage(); err == nil {
+			return img, nil
+		}
 	}
-	return store.Image(verboseName(dref))
+	return nil, storage.ErrImageUnknown
 }
 
 func (s *storageTransport) GetImage(ref types.ImageReference) (*storage.Image, error) {

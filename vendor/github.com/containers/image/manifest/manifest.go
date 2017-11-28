@@ -37,7 +37,7 @@ var DefaultRequestedManifestMIMETypes = []string{
 	DockerV2Schema2MediaType,
 	DockerV2Schema1SignedMediaType,
 	DockerV2Schema1MediaType,
-	// DockerV2ListMediaType, // FIXME: Restore this ASAP
+	DockerV2ListMediaType,
 }
 
 // Manifest is an interface for parsing, modifying image manifests in isolation.
@@ -56,6 +56,12 @@ type Manifest interface {
 	LayerInfos() []types.BlobInfo
 	// UpdateLayerInfos replaces the original layers with the specified BlobInfos (size+digest+urls), in order (the root layer first, and then successive layered layers)
 	UpdateLayerInfos(layerInfos []types.BlobInfo) error
+
+	// ImageID computes an ID which can uniquely identify this image by its contents, irrespective
+	// of which (of possibly more than one simultaneously valid) reference was used to locate the
+	// image, and unchanged by whether or how the layers are compressed.  The result takes the form
+	// of the hexadecimal portion of a digest.Digest.
+	ImageID(diffIDs []digest.Digest) (string, error)
 
 	// Inspect returns various information for (skopeo inspect) parsed from the manifest,
 	// incorporating information from a configuration blob returned by configGetter, if
@@ -172,6 +178,11 @@ func AddDummyV2S1Signature(manifest []byte) ([]byte, error) {
 	return js.PrettySignature("signatures")
 }
 
+// MIMETypeIsMultiImage returns true if mimeType is a list of images
+func MIMETypeIsMultiImage(mimeType string) bool {
+	return mimeType == DockerV2ListMediaType
+}
+
 // NormalizedMIMEType returns the effective MIME type of a manifest MIME type returned by a server,
 // centralizing various workarounds.
 func NormalizedMIMEType(input string) string {
@@ -214,4 +225,14 @@ func FromBlob(manblob []byte, mt string) (Manifest, error) {
 	default: // Note that this may not be reachable, NormalizedMIMEType has a default for unknown values.
 		return nil, fmt.Errorf("Unimplemented manifest MIME type %s", mt)
 	}
+}
+
+// LayerInfosToStrings converts a list of layer infos, presumably obtained from a Manifest.LayerInfos()
+// method call, into a format suitable for inclusion in a types.ImageInspectInfo structure.
+func LayerInfosToStrings(infos []types.BlobInfo) []string {
+	layers := make([]string, len(infos))
+	for i, info := range infos {
+		layers[i] = info.Digest.String()
+	}
+	return layers
 }

@@ -178,7 +178,7 @@ func Schema2Clone(src *Schema2) *Schema2 {
 
 // ConfigInfo returns a complete BlobInfo for the separate config object, or a BlobInfo{Digest:""} if there isn't a separate object.
 func (m *Schema2) ConfigInfo() types.BlobInfo {
-	return types.BlobInfo{Digest: m.ConfigDescriptor.Digest, Size: m.ConfigDescriptor.Size, MediaType: DockerV2Schema2ConfigMediaType}
+	return types.BlobInfo{Digest: m.ConfigDescriptor.Digest, Size: m.ConfigDescriptor.Size}
 }
 
 // LayerInfos returns a list of BlobInfos of layers referenced by this image, in order (the root layer first, and then successive layered layers).
@@ -188,10 +188,9 @@ func (m *Schema2) LayerInfos() []types.BlobInfo {
 	blobs := []types.BlobInfo{}
 	for _, layer := range m.LayersDescriptors {
 		blobs = append(blobs, types.BlobInfo{
-			Digest:    layer.Digest,
-			Size:      layer.Size,
-			URLs:      layer.URLs,
-			MediaType: layer.MediaType,
+			Digest: layer.Digest,
+			Size:   layer.Size,
+			URLs:   layer.URLs,
 		})
 	}
 	return blobs
@@ -229,13 +228,24 @@ func (m *Schema2) Inspect(configGetter func(types.BlobInfo) ([]byte, error)) (*t
 	if err := json.Unmarshal(config, s2); err != nil {
 		return nil, err
 	}
-	return &types.ImageInspectInfo{
+	i := &types.ImageInspectInfo{
 		Tag:           "",
 		Created:       s2.Created,
 		DockerVersion: s2.DockerVersion,
-		Labels:        s2.Config.Labels,
 		Architecture:  s2.Architecture,
 		Os:            s2.OS,
-		Layers:        []string{},
-	}, nil
+		Layers:        LayerInfosToStrings(m.LayerInfos()),
+	}
+	if s2.Config != nil {
+		i.Labels = s2.Config.Labels
+	}
+	return i, nil
+}
+
+// ImageID computes an ID which can uniquely identify this image by its contents.
+func (m *Schema2) ImageID([]digest.Digest) (string, error) {
+	if err := m.ConfigDescriptor.Digest.Validate(); err != nil {
+		return "", err
+	}
+	return m.ConfigDescriptor.Digest.Hex(), nil
 }

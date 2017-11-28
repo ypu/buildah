@@ -11,7 +11,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 
 	"github.com/containers/image/image"
@@ -20,7 +19,6 @@ import (
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/archive"
 	"github.com/containers/storage/pkg/ioutils"
-	"github.com/docker/docker/api/types/versions"
 	digest "github.com/opencontainers/go-digest"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -36,7 +34,8 @@ var (
 	// ErrBlobSizeMismatch is returned when PutBlob() is given a blob
 	// with an expected size that doesn't match the reader.
 	ErrBlobSizeMismatch = errors.New("blob size mismatch")
-	// ErrNoManifestLists is returned when GetTargetManifest() is called.
+	// ErrNoManifestLists is returned when GetManifest() is called.
+	// with a non-nil instanceDigest.
 	ErrNoManifestLists = errors.New("manifest lists are not supported by this transport")
 	// ErrNoSuchImage is returned when we attempt to access an image which
 	// doesn't exist in the storage area.
@@ -52,6 +51,8 @@ type storageImageSource struct {
 }
 
 type storageImageDestination struct {
+	image          types.ImageCloser
+	systemContext  *types.SystemContext
 	imageRef       storageReference                // The reference we'll use to name the image
 	publicRef      storageReference                // The reference we return when asked about the name we'll give to the image
 	directory      string                          // Temporary directory where we store blobs until Commit() time
@@ -64,8 +65,8 @@ type storageImageDestination struct {
 	SignatureSizes []int                           `json:"signature-sizes,omitempty"` // List of sizes of each signature slice
 }
 
-type storageImage struct {
-	types.Image
+type storageImageCloser struct {
+	types.ImageCloser
 	size int64
 }
 
@@ -157,9 +158,13 @@ func (s *storageImageSource) getBlobAndLayerID(info types.BlobInfo) (rc io.ReadC
 }
 
 // GetManifest() reads the image's manifest.
-func (s *storageImageSource) GetManifest() (manifestBlob []byte, MIMEType string, err error) {
+func (s *storageImageSource) GetManifest(instanceDigest *digest.Digest) (manifestBlob []byte, MIMEType string, err error) {
+	if instanceDigest != nil {
+		return nil, "", ErrNoManifestLists
+	}
 	if len(s.cachedManifest) == 0 {
-		cachedBlob, err := s.imageRef.transport.store.ImageBigData(s.ID, "manifest")
+		// We stored the manifest as an item named after storage.ImageDigestBigDataKey.
+		cachedBlob, err := s.imageRef.transport.store.ImageBigData(s.ID, storage.ImageDigestBigDataKey)
 		if err != nil {
 			return nil, "", err
 		}
@@ -168,9 +173,9 @@ func (s *storageImageSource) GetManifest() (manifestBlob []byte, MIMEType string
 	return s.cachedManifest, manifest.GuessMIMEType(s.cachedManifest), err
 }
 
-// UpdatedLayerInfos() returns the list of layer blobs that make up the root filesystem of
+// LayerInfosForCopy() returns the list of layer blobs that make up the root filesystem of
 // the image, after they've been decompressed.
-func (s *storageImageSource) UpdatedLayerInfos() []types.BlobInfo {
+func (s *storageImageSource) LayerInfosForCopy() []types.BlobInfo {
 	simg, err := s.imageRef.transport.store.Image(s.ID)
 	if err != nil {
 		logrus.Errorf("error reading image %q: %v", s.ID, err)
@@ -178,7 +183,7 @@ func (s *storageImageSource) UpdatedLayerInfos() []types.BlobInfo {
 	}
 	updatedBlobInfos := []types.BlobInfo{}
 	layerID := simg.TopLayer
-	_, manifestType, err := s.GetManifest()
+	_, manifestType, err := s.GetManifest(nil)
 	if err != nil {
 		logrus.Errorf("error reading image manifest for %q: %v", s.ID, err)
 		return nil
@@ -216,13 +221,11 @@ func (s *storageImageSource) UpdatedLayerInfos() []types.BlobInfo {
 	return updatedBlobInfos
 }
 
-// GetTargetManifest() is not supported.
-func (s *storageImageSource) GetTargetManifest(d digest.Digest) (manifestBlob []byte, MIMEType string, err error) {
-	return nil, "", ErrNoManifestLists
-}
-
 // GetSignatures() parses the image's signatures blob into a slice of byte slices.
-func (s *storageImageSource) GetSignatures(ctx context.Context) (signatures [][]byte, err error) {
+func (s *storageImageSource) GetSignatures(ctx context.Context, instanceDigest *digest.Digest) (signatures [][]byte, err error) {
+	if instanceDigest != nil {
+		return nil, ErrNoManifestLists
+	}
 	var offset int
 	sigslice := [][]byte{}
 	signature := []byte{}
@@ -245,7 +248,7 @@ func (s *storageImageSource) GetSignatures(ctx context.Context) (signatures [][]
 
 // newImageDestination sets us up to write a new image, caching blobs in a temporary directory until
 // it's time to Commit() the image
-func newImageDestination(imageRef storageReference) (*storageImageDestination, error) {
+func newImageDestination(ctx *types.SystemContext, imageRef storageReference) (*storageImageDestination, error) {
 	directory, err := ioutil.TempDir(temporaryDirectoryForBigFiles, "storage")
 	if err != nil {
 		return nil, errors.Wrapf(err, "error creating a temporary directory")
@@ -257,6 +260,7 @@ func newImageDestination(imageRef storageReference) (*storageImageDestination, e
 	publicRef := imageRef
 	publicRef.name = nil
 	image := &storageImageDestination{
+		systemContext:  ctx,
 		imageRef:       imageRef,
 		publicRef:      publicRef,
 		directory:      directory,
@@ -402,137 +406,51 @@ func (s *storageImageDestination) ReapplyBlob(blobinfo types.BlobInfo) (types.Bl
 	return blobinfo, nil
 }
 
-// computeID computes a recommended image ID based on information we have so far.
+// computeID computes a recommended image ID based on information we have so far.  If
+// the manifest is not of a type that we recognize, we return an empty value, indicating
+// that since we don't have a recommendation, a random ID should be used if one needs
+// to be allocated.
 func (s *storageImageDestination) computeID(m manifest.Manifest) string {
-	mb, err := m.Serialize()
+	// Build the diffID list.  We need the decompressed sums that we've been calculating to
+	// fill in the DiffIDs.  It's expected (but not enforced by us) that the number of
+	// diffIDs corresponds to the number of non-EmptyLayer entries in the history.
+	var diffIDs []digest.Digest
+	switch m.(type) {
+	case *manifest.Schema1:
+		// Build a list of the diffIDs we've generated for the non-throwaway FS layers,
+		// in reverse of the order in which they were originally listed.
+		s1, ok := m.(*manifest.Schema1)
+		if !ok {
+			// Shouldn't happen
+			logrus.Debugf("internal error reading schema 1 manifest")
+			return ""
+		}
+		for i, history := range s1.History {
+			compat := manifest.Schema1V1Compatibility{}
+			if err := json.Unmarshal([]byte(history.V1Compatibility), &compat); err != nil {
+				logrus.Debugf("internal error reading schema 1 history: %v", err)
+				return ""
+			}
+			if compat.ThrowAway {
+				continue
+			}
+			blobSum := s1.FSLayers[i].BlobSum
+			diffID, ok := s.blobDiffIDs[blobSum]
+			if !ok {
+				logrus.Infof("error looking up diffID for layer %q", blobSum.String())
+				return ""
+			}
+			diffIDs = append([]digest.Digest{diffID}, diffIDs...)
+		}
+	case *manifest.Schema2, *manifest.OCI1:
+		// We know the ID calculation for these formats doesn't actually use the diffIDs,
+		// so we don't need to populate the diffID list.
+	}
+	id, err := m.ImageID(diffIDs)
 	if err != nil {
 		return ""
 	}
-	switch manifest.GuessMIMEType(mb) {
-	case manifest.DockerV2Schema2MediaType, imgspecv1.MediaTypeImageManifest:
-		// For Schema2 and OCI1(?), the ID is just the hex part of the digest of the config blob.
-		logrus.Debugf("trivial image ID for configured blob")
-		configInfo := m.ConfigInfo()
-		if configInfo.Digest.Validate() == nil {
-			return configInfo.Digest.Hex()
-		}
-		return ""
-	case manifest.DockerV2Schema1MediaType, manifest.DockerV2Schema1SignedMediaType:
-		// Convert the schema 1 compat info into a schema 2 config, constructing some of the fields
-		// that aren't directly comparable using info from the manifest.
-		logrus.Debugf("computing image ID using compat data")
-		s1, ok := m.(*manifest.Schema1)
-		if !ok {
-			logrus.Debugf("schema type was guessed wrong?")
-			return ""
-		}
-		if len(s1.History) == 0 {
-			logrus.Debugf("image has no layers")
-			return ""
-		}
-		s2 := struct {
-			manifest.Schema2Image
-			ID        string `json:"id,omitempty"`
-			Parent    string `json:"parent,omitempty"`
-			ParentID  string `json:"parent_id,omitempty"`
-			LayerID   string `json:"layer_id,omitempty"`
-			ThrowAway bool   `json:"throwaway,omitempty"`
-			Size      int64  `json:",omitempty"`
-		}{}
-		config := []byte(s1.History[0].V1Compatibility)
-		if json.Unmarshal(config, &s2) != nil {
-			logrus.Debugf("error decoding configuration")
-			return ""
-		}
-		// Images created with versions prior to 1.8.3 require us to rebuild the object.
-		if s2.DockerVersion != "" && versions.LessThan(s2.DockerVersion, "1.8.3") {
-			err = json.Unmarshal(config, &s2)
-			if err != nil {
-				logrus.Infof("error decoding compat image config %s: %v", string(config), err)
-				return ""
-			}
-			config, err = json.Marshal(&s2)
-			if err != nil {
-				logrus.Infof("error re-encoding compat image config %#v: %v", s2, err)
-				return ""
-			}
-		}
-		// Build the history.
-		for _, h := range s1.History {
-			compat := manifest.Schema1V1Compatibility{}
-			if json.Unmarshal([]byte(h.V1Compatibility), &compat) != nil {
-				logrus.Debugf("error decoding history information")
-				return ""
-			}
-			hitem := manifest.Schema2History{
-				Created:    compat.Created,
-				CreatedBy:  strings.Join(compat.ContainerConfig.Cmd, " "),
-				Comment:    compat.Comment,
-				EmptyLayer: compat.ThrowAway,
-			}
-			s2.History = append([]manifest.Schema2History{hitem}, s2.History...)
-		}
-		// Build the rootfs information.  We need the decompressed sums that we've been
-		// calculating to fill in the DiffIDs.
-		s2.RootFS = &manifest.Schema2RootFS{
-			Type: "layers",
-		}
-		for _, fslayer := range s1.FSLayers {
-			blobSum := fslayer.BlobSum
-			diffID, ok := s.blobDiffIDs[blobSum]
-			if !ok {
-				logrus.Infof("error looking up diffID for blob %q", string(blobSum))
-				return ""
-			}
-			s2.RootFS.DiffIDs = append([]digest.Digest{diffID}, s2.RootFS.DiffIDs...)
-		}
-		// And now for some raw manipulation.
-		raw := make(map[string]*json.RawMessage)
-		err = json.Unmarshal(config, &raw)
-		if err != nil {
-			logrus.Infof("error re-decoding compat image config %#v: %v", s2, err)
-			return ""
-		}
-		// Drop some fields.
-		delete(raw, "id")
-		delete(raw, "parent")
-		delete(raw, "parent_id")
-		delete(raw, "layer_id")
-		delete(raw, "throwaway")
-		delete(raw, "Size")
-		// Add the history and rootfs information.
-		rootfs, err := json.Marshal(s2.RootFS)
-		if err != nil {
-			logrus.Infof("error encoding rootfs information %#v: %v", s2.RootFS, err)
-			return ""
-		}
-		rawRootfs := json.RawMessage(rootfs)
-		raw["rootfs"] = &rawRootfs
-		history, err := json.Marshal(s2.History)
-		if err != nil {
-			logrus.Infof("error encoding history information %#v: %v", s2.History, err)
-			return ""
-		}
-		rawHistory := json.RawMessage(history)
-		raw["history"] = &rawHistory
-		// Encode the result, and take the digest of that result.
-		config, err = json.Marshal(raw)
-		if err != nil {
-			logrus.Infof("error re-encoding compat image config %#v: %v", s2, err)
-			return ""
-		}
-		return digest.FromBytes(config).Hex()
-	case manifest.DockerV2ListMediaType:
-		logrus.Debugf("no image ID for manifest list")
-		// FIXME
-	case imgspecv1.MediaTypeImageIndex:
-		logrus.Debugf("no image ID for manifest index")
-		// FIXME
-	default:
-		logrus.Debugf("no image ID for unrecognized manifest type %q", manifest.GuessMIMEType(mb))
-		// FIXME
-	}
-	return ""
+	return id
 }
 
 // getConfigBlob exists only to let us retrieve the configuration blob so that the manifest package can dig
@@ -722,8 +640,9 @@ func (s *storageImageDestination) Commit() error {
 		}
 		logrus.Debugf("set names of image %q to %v", img.ID, names)
 	}
-	// Save the manifest.
-	if err := s.imageRef.transport.store.SetImageBigData(img.ID, "manifest", s.manifest); err != nil {
+	// Save the manifest.  Use storage.ImageDigestBigDataKey as the item's
+	// name, so that its digest can be used to locate the image in the Store.
+	if err := s.imageRef.transport.store.SetImageBigData(img.ID, storage.ImageDigestBigDataKey, s.manifest); err != nil {
 		if _, err2 := s.imageRef.transport.store.DeleteImage(img.ID, true); err2 != nil {
 			logrus.Debugf("error deleting incomplete image %q: %v", img.ID, err2)
 		}
@@ -857,13 +776,18 @@ func (s *storageImageSource) getSize() (int64, error) {
 	return sum, nil
 }
 
+// Size() returns the previously-computed size of the image, with no error.
+func (s *storageImageCloser) Size() (int64, error) {
+	return s.size, nil
+}
+
 // newImage creates an image that also knows its size
-func newImage(s storageReference) (types.Image, error) {
+func newImage(ctx *types.SystemContext, s storageReference) (types.ImageCloser, error) {
 	src, err := newImageSource(s)
 	if err != nil {
 		return nil, err
 	}
-	img, err := image.FromSource(src)
+	img, err := image.FromSource(ctx, src)
 	if err != nil {
 		return nil, err
 	}
@@ -871,10 +795,5 @@ func newImage(s storageReference) (types.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &storageImage{Image: img, size: size}, nil
-}
-
-// Size() returns the previously-computed size of the image, with no error.
-func (s storageImage) Size() (int64, error) {
-	return s.size, nil
+	return &storageImageCloser{ImageCloser: img, size: size}, nil
 }
