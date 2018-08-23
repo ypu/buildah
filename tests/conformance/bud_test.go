@@ -1,6 +1,7 @@
 package conformance
 
 import (
+	"io/ioutil"
 	"path/filepath"
 	"os"
 	"strings"
@@ -64,33 +65,39 @@ var _ = Describe("Buildah build conformance test", func() {
 				buildahoptions = append([]string{"bud", "-t", "buildahimage"}, append(test.ExtraOptions, buildDir)...)
 				dockeroptions = append([]string{"build", "-t", "docker.io/dockerimage"}, append(test.ExtraOptions, buildDir)...)
 			}
+
+			dockerfile, _ := ioutil.ReadFile(filepath.Join(buildDir, "Dockerfile"))
+			errMsg := strings.Replace(ERR_MSG, "DOCKERFILECONTENT", strings.Replace(string(dockerfile), "\n", "\n\t", -1), -1)
+			buildahcmds := strings.Join(append([]string{buildahtest.BuildAhBinary}, buildahoptions...), " ")
+			errMsg = strings.Replace(errMsg, "BUILDAHCMD", buildahcmds, -1)
+
 			buildah := buildahtest.BuildAh(buildahoptions)
 			buildah.WaitWithDefaultTimeout()
-			Expect(buildah.ExitCode()).To(Equal(0))
+			Expect(buildah.ExitCode()).To(Equal(0), strings.Replace(errMsg, "FAILEDREASON", "Buildah bud failed.", -1))
 			buildahoutput := buildah.OutputToString()
 			buildaherr := buildah.ErrorToString()
 
 			push := SystemExec("podman", []string{"push", "buildahimage", "docker-daemon:buildahimage:latest"})
 			push.WaitWithDefaultTimeout()
-			Expect(push.ExitCode()).To(Equal(0))
+			Expect(push.ExitCode()).To(Equal(0), strings.Replace(errMsg, "FAILEDREASON", "Failed to push image to docker daemon.", -1))
 
 			// Commet ID check
 			check := buildahtest.Docker([]string{"images", "-f", "reference=buildahimage", "-q"})
 			check.WaitWithDefaultTimeout()
-			Expect(buildahoutput).To(ContainSubstring(check.OutputToString()))
+			Expect(buildahoutput).To(ContainSubstring(check.OutputToString()), strings.Replace(errMsg, "FAILEDREASON", "Image ID changed after push to docker daemon.", -1))
 
 			// Image info check
 			if test.WithoutDocker {
 				br := regexp.MustCompile(test.BuildahRegex)
-				Expect(br.MatchString(buildahoutput)).To(BeTrue())
+				Expect(br.MatchString(buildahoutput)).To(BeTrue(), strings.Replace(errMsg, "FAILEDREASON", "Buildah Output is not as expect.", -1))
 				if test.BuildahErrRegex != "" {
 					bre := regexp.MustCompile(test.BuildahErrRegex)
-					Expect(bre.MatchString(buildaherr)).To(BeTrue())
+					Expect(bre.MatchString(buildaherr)).To(BeTrue(), strings.Replace(errMsg, "FAILEDREASON", "Buildah Output is not as expect", -1))
 				}
 			} else {
 				docker := buildahtest.Docker(dockeroptions)
 				docker.WaitWithDefaultTimeout()
-				Expect(docker.ExitCode()).To(Equal(0))
+				Expect(docker.ExitCode()).To(Equal(0), strings.Replace(errMsg, "FAILEDREASON", "Docker build failed.", -1))
 				dockeroutput := docker.OutputToString()
 				dockererr := docker.ErrorToString()
 
@@ -99,15 +106,20 @@ var _ = Describe("Buildah build conformance test", func() {
 					dr := regexp.MustCompile(test.DockerRegex)
 					buildahstrs := br.FindAllStringSubmatch(buildahoutput, -1)
 					dockerstrs := dr.FindAllStringSubmatch(dockeroutput, -1)
-					Expect(len(buildahstrs)).To(Equal(len(dockerstrs)))
+					Expect(len(buildahstrs)).To(Equal(len(dockerstrs)), strings.Replace(errMsg, "FAILEDREASON", "Buildah output is different from docker.", -1))
 					for i := 0; i < len(buildahstrs); i ++ {
-						Expect(buildahstrs[i][1]).To(Equal(dockerstrs[i][1]))
+						Expect(buildahstrs[i][1]).To(Equal(dockerstrs[i][1]), strings.Replace(errMsg, "FAILEDREASON", "Buildah output is different from docker", -1))
 					}
 				}
 				if test.BuildahErrRegex != "" {
 					bre := regexp.MustCompile(test.BuildahErrRegex)
 					dre := regexp.MustCompile(test.DockerErrRegex)
-					Expect(bre.FindStringSubmatch(buildaherr)[1]).To(Equal(dre.FindStringSubmatch(dockererr)[1]))
+					buildaherrstrs := bre.FindAllStringSubmatch(buildaherr, -1)
+					dockererrstrs := dre.FindAllStringSubmatch(dockererr, -1)
+					Expect(len(buildaherrstrs)).To(Equal(len(dockererrstrs)), strings.Replace(errMsg, "FAILEDREASON", "Buildah output is different from docker.", -1))
+					for i := 0; i < len(buildaherrstrs); i ++ {
+						Expect(buildaherrstrs[i][1]).To(Equal(dockererrstrs[i][1]), strings.Replace(errMsg, "FAILEDREASON", "Buildah output is different from docker", -1))
+					}
 				}
 
 				buildahimage := buildahtest.Docker([]string{"inspect", "buildahimage:latest"})
@@ -115,13 +127,13 @@ var _ = Describe("Buildah build conformance test", func() {
 				dockerimage := buildahtest.Docker([]string{"inspect", "dockerimage:latest"})
 				dockerimage.WaitWithDefaultTimeout()
 				miss, left, diff, same := CompareJSON(dockerimage.OutputToJSON()[0], buildahimage.OutputToJSON()[0], skipKeyWords)
-				Expect(same).To(BeTrue(), InspectCompareResult(miss, left, diff))
+				Expect(same).To(BeTrue(), strings.Replace(errMsg, "FAILEDREASON", InspectCompareResult(miss, left, diff), -1))
 
 				//Check fs with container-diff
 				fscheck := SystemExec("container-diff", []string{"diff", "daemon://buildahimage", "daemon://dockerimage", "--type=file"})
 				fscheck.WaitWithDefaultTimeout()
 				fsr := regexp.MustCompile("These entries.*?None")
-				Expect(len(fsr.FindAllStringSubmatch(fscheck.OutputToString(), -1))).To(Equal(3))
+				Expect(len(fsr.FindAllStringSubmatch(fscheck.OutputToString(), -1))).To(Equal(3), strings.Replace(errMsg, "FAILEDREASON", "Files inside image is different.", -1))
 
 			}
 
@@ -133,6 +145,7 @@ var _ = Describe("Buildah build conformance test", func() {
 			IsFile:       true,
 			ExtraOptions: []string{"--no-cache"},
 		}),
+
 		Entry("copy file to root", BuildTest{
 			Dockerfile:    "Dockerfile.copyfrom_1",
 			BuildahRegex:  "[-rw]+.*?/a",
@@ -349,7 +362,6 @@ var _ = Describe("Buildah build conformance test", func() {
 			WithoutDocker: true,
 			ExtraOptions: []string{"--no-cache", "-v", "TEMPDIR:/mountdir", "-v", "TEMPDIR/Dockerfile.env:/mountfile"},
 		}),
-
 
 	)
 })

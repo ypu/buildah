@@ -28,6 +28,12 @@ var (
 	FEDORA_MINIMAL     = "registry.fedoraproject.org/fedora-minimal:latest"
 	defaultWaitTimeout = 240
 	GLOBALOPTIONS      = []string{"--root", "--runroot", "--registries-conf", "--registries-conf-dir", "--storage-driver", "--storage-opt"}
+	ERR_MSG            = `The test Dockerfile:
+	DOCKERFILECONTENT
+The Buildah bud command:
+	BUILDAHCMD
+Test failed reason:
+	FAILEDREASON`
 )
 
 // BuildahTestSession wraps the gexec.session so we can extend it
