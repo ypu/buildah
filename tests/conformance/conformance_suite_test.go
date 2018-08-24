@@ -28,6 +28,7 @@ var (
 	FEDORA_MINIMAL     = "registry.fedoraproject.org/fedora-minimal:latest"
 	defaultWaitTimeout = 240
 	GLOBALOPTIONS      = []string{"--root", "--runroot", "--registries-conf", "--registries-conf-dir", "--storage-driver", "--storage-opt"}
+	BUILDAH_BUD_OPTIONS = []string{""}
 	ERR_MSG            = `The test Dockerfile:
 	DOCKERFILECONTENT
 The Buildah bud command:
@@ -48,6 +49,7 @@ type BuildAhTest struct {
 	TempDir        string
 	TestDataDir    string
 	GlobalOptions  map[string]string
+	BuildahBudOptions []string
 }
 
 // TestBuildAh ginkgo master function
@@ -98,6 +100,7 @@ func BuildahCreate(tempDir string) BuildAhTest {
 	var globalOptions map[string]string
 	var option string
 	var envKey string
+	var buildahCmdOptions []string
 	cwd, _ := os.Getwd()
 
 	for _, n := range GLOBALOPTIONS {
@@ -106,6 +109,10 @@ func BuildahCreate(tempDir string) BuildAhTest {
 		if envSeted(envKey) {
 			globalOptions[option] = os.Getenv(envKey)
 		}
+	}
+
+	if envSeted("BUILDAH_BUD_OPTIONS") {
+		buildahCmdOptions = strings.Split(os.Getenv("BUILDAH_BUD_OPTIONS"), " ")
 	}
 
 	buildAhBinary := filepath.Join(cwd, "../../buildah")
@@ -127,12 +134,13 @@ func BuildahCreate(tempDir string) BuildAhTest {
 		TempDir:        tempDir,
 		TestDataDir:    testDataDir,
 		GlobalOptions:  globalOptions,
+		BuildahBudOptions: buildahCmdOptions,
 	}
 }
 
-//MakeOptions assembles all the buildah global options
-func (p *BuildAhTest) MakeOptions() []string {
-	var addOptions []string
+//MakeOptions assembles all the buildah options
+func (p *BuildAhTest) MakeOptions(args []string) []string {
+	var addOptions, subArgs []string
 	var option string
 	for _, n := range GLOBALOPTIONS {
 		option = strings.Replace(strings.Title(strings.Trim(n, " ")), " ", "", -1 )
@@ -140,13 +148,36 @@ func (p *BuildAhTest) MakeOptions() []string {
 			addOptions = append(addOptions, n, p.GlobalOptions[option])
 		}
 	}
+
+	addOptions = append(addOptions, args[0])
+	if (args[0] == "bud") || (args[0] == "build-using-dockerfile") {
+		m := make(map[string]bool)
+		subArgs = p.BuildahBudOptions
+                for i := 0; i < len(subArgs); i++ {
+                        m[subArgs[i]] = true
+                }
+		for i := 1; i < len(args); i++ {
+			if _, ok := m[args[i]]; !ok {
+				subArgs = append(subArgs, args[i])
+			}
+		}
+	} else {
+		subArgs = args[1:]
+	}
+
+	addOptions = append(addOptions, subArgs...)
+
 	return addOptions
 }
 
 // BuildAh is the exec call to buildah on the filesystem
 func (p *BuildAhTest) BuildAh(args []string) *BuildahTestSession {
-	buildAhOptions := p.MakeOptions()
-	buildAhOptions = append(buildAhOptions, args...)
+	if len(args) == 0 {
+		Fail(fmt.Sprintf("Need give a subcommand or -v to buildah command line"))
+	}
+
+	buildAhOptions := p.MakeOptions(args)
+
 	fmt.Printf("Running: %s %s\n", p.BuildAhBinary, strings.Join(buildAhOptions, " "))
 	command := exec.Command(p.BuildAhBinary, buildAhOptions...)
 	session, err := gexec.Start(command, GinkgoWriter, GinkgoWriter)
