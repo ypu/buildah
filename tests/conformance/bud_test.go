@@ -391,4 +391,38 @@ var _ = Describe("Buildah build conformance test", func() {
 			ExtraOptions:  []string{"--no-cache", "-v", "TEMPDIR:/mountdir", "-v", "TEMPDIR/Dockerfile.env:/mountfile"},
 		}),
 	)
+
+	It("link test", func() {
+		dockerfilePath := filepath.Join(buildahtest.TestDataDir, "link")
+		buildDir := buildahtest.TempDir
+		err := CopyFiles(dockerfilePath, buildahtest.TempDir)
+		Expect(err).To(BeNil())
+
+		d := []byte("Hello World!")
+		err = ioutil.WriteFile(filepath.Join(buildahtest.TempDir, "hello.sh"), d, 0644)
+		Expect(err).To(BeNil())
+
+		buildah := buildahtest.BuildAh([]string{"bud", "-t", "hello", "--layers", buildDir})
+		buildah.WaitWithDefaultTimeout()
+		Expect(buildah.ExitCode()).To(Equal(0))
+
+		podman := SystemExec("podman", []string{"run", "hello"})
+		podman.WaitWithDefaultTimeout()
+		Expect(podman.ExitCode()).To(Equal(0))
+		Expect(podman.OutputToString()).To(ContainSubstring("Hello World!"))
+
+		d = []byte("Hello Cache!")
+		err = ioutil.WriteFile(filepath.Join(buildahtest.TempDir, "hello.sh"), d, 0644)
+		Expect(err).To(BeNil())
+
+		buildah = buildahtest.BuildAh([]string{"bud", "-t", "hello", "--layers", buildDir})
+		buildah.WaitWithDefaultTimeout()
+		Expect(buildah.ExitCode()).To(Equal(0))
+
+		podman = SystemExec("podman", []string{"run", "hello"})
+		podman.WaitWithDefaultTimeout()
+		Expect(podman.ExitCode()).To(Equal(0))
+		Expect(podman.OutputToString()).To(ContainSubstring("Hello Cache!"))
+       })
+
 })
