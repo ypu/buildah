@@ -398,7 +398,7 @@ var _ = Describe("Buildah build conformance test", func() {
 		err := CopyFiles(dockerfilePath, buildahtest.TempDir)
 		Expect(err).To(BeNil())
 
-		d := []byte("Hello World!")
+		d := []byte("echo 'Hello World!'")
 		err = ioutil.WriteFile(filepath.Join(buildahtest.TempDir, "hello.sh"), d, 0644)
 		Expect(err).To(BeNil())
 
@@ -406,12 +406,16 @@ var _ = Describe("Buildah build conformance test", func() {
 		buildah.WaitWithDefaultTimeout()
 		Expect(buildah.ExitCode()).To(Equal(0))
 
-		podman := SystemExec("podman", []string{"run", "hello"})
-		podman.WaitWithDefaultTimeout()
-		Expect(podman.ExitCode()).To(Equal(0))
-		Expect(podman.OutputToString()).To(ContainSubstring("Hello World!"))
+		buildah = buildahtest.BuildAh([]string{"from", "hello"})
+		// cid := buildah.OutputToString()
+		buildah.WaitWithDefaultTimeout()
+		Expect(buildah.ExitCode()).To(Equal(0))
+		buildah = buildahtest.BuildAh([]string{"run", "hello-working-container", "cat", "/tmp/hello.sh"})
+		buildah.WaitWithDefaultTimeout()
+		Expect(buildah.ExitCode()).To(Equal(0))
+		Expect(buildah.OutputToString()).To(ContainSubstring("Hello World!"))
 
-		d = []byte("Hello Cache!")
+		d = []byte("echo 'Hello Cache!'")
 		err = ioutil.WriteFile(filepath.Join(buildahtest.TempDir, "hello.sh"), d, 0644)
 		Expect(err).To(BeNil())
 
@@ -419,10 +423,14 @@ var _ = Describe("Buildah build conformance test", func() {
 		buildah.WaitWithDefaultTimeout()
 		Expect(buildah.ExitCode()).To(Equal(0))
 
-		podman = SystemExec("podman", []string{"run", "hello"})
-		podman.WaitWithDefaultTimeout()
-		Expect(podman.ExitCode()).To(Equal(0))
-		Expect(podman.OutputToString()).To(ContainSubstring("Hello Cache!"))
-       })
+		buildah = buildahtest.BuildAh([]string{"from", "hello"})
+		// cid = buildah.OutputToString()
+		buildah.WaitWithDefaultTimeout()
+		Expect(buildah.ExitCode()).To(Equal(0))
+		buildah = buildahtest.BuildAh([]string{"run", "hello-working-container-1", "cat", "/tmp/hello.sh"})
+		buildah.WaitWithDefaultTimeout()
+		Expect(buildah.ExitCode()).To(Equal(0))
+		Expect(buildah.OutputToString()).To(ContainSubstring("Hello Cache!"))
+	})
 
 })
