@@ -1,3 +1,3 @@
 FROM alpine
-COPY hello.sh /tmp
-CMD /tmp/hello.sh
+COPY hello_world.sh /tmp
+CMD /tmp/hello_world.sh
